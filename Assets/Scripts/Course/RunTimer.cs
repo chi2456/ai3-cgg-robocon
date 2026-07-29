@@ -25,13 +25,13 @@ namespace Robocon.Course
             if (goalLine == null) goalLine = FindFirstObjectByType<GoalLine>();
 
             if (startLine != null) startLine.RobotEntered += OnRobotStarted;
-            if (goalLine != null) goalLine.RobotEntered += OnRobotGoaled;
+            if (goalLine != null) goalLine.RobotCleared += OnRobotGoaled;
         }
 
         private void OnDestroy()
         {
             if (startLine != null) startLine.RobotEntered -= OnRobotStarted;
-            if (goalLine != null) goalLine.RobotEntered -= OnRobotGoaled;
+            if (goalLine != null) goalLine.RobotCleared -= OnRobotGoaled;
             if (activeValidityChecker != null) activeValidityChecker.Invalidated -= OnRunInvalidated;
         }
 

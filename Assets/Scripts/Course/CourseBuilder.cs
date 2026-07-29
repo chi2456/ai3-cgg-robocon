@@ -25,16 +25,16 @@ namespace Robocon.Course
         [SerializeField]
         private CourseRect[] segments = new CourseRect[]
         {
-            new CourseRect(0.0f, 1.8f, 0.0f, 0.6f), // R1 下段/スタート
-            new CourseRect(1.2f, 1.8f, 0.6f, 1.2f), // R2 縦ターン
-            new CourseRect(1.2f, 2.4f, 1.2f, 1.8f), // R3 中段
-            new CourseRect(1.8f, 2.4f, 1.8f, 2.4f), // R4 縦ターン
-            new CourseRect(0.6f, 2.4f, 2.4f, 3.0f), // R5 上段/ゴール
+            new CourseRect(0.0f, 2.4f, 0.0f, 0.6f), // R1 下段（全幅）
+            new CourseRect(0.0f, 0.6f, 0.6f, 1.2f), // R2 縦接続（左側）
+            new CourseRect(0.0f, 2.4f, 1.2f, 1.8f), // R3 中段（全幅）
+            new CourseRect(1.8f, 2.4f, 1.8f, 2.4f), // R4 縦接続（右側）
+            new CourseRect(0.0f, 2.4f, 2.4f, 3.0f), // R5 上段（全幅）
         };
 
         [Header("スタート/ゴール セル (格子インデックス)")]
-        [SerializeField] private Vector2Int startCell = new Vector2Int(0, 0);
-        [SerializeField] private Vector2Int goalCell = new Vector2Int(1, 4);
+        [SerializeField] private Vector2Int startCell = new Vector2Int(2, 0); // R1内 X≈1.8〜2.4（右端）
+        [SerializeField] private Vector2Int goalCell = new Vector2Int(0, 4); // R5内 X≈0.0〜0.6（左端）
 
         [Header("壁・床の見た目/物理パラメータ")]
         [SerializeField] private float wallHeight = 0.4f;
@@ -46,6 +46,8 @@ namespace Robocon.Course
         [SerializeField] private float triggerThickness = 0.05f;
         [SerializeField] private float triggerHeight = 0.6f;
         [SerializeField] private float triggerWidthMargin = 0.02f;
+        [Range(0.05f, 0.9f)]
+        [SerializeField] private float goalLineFraction = 0.3f;
 
         public static CourseBuilder Instance { get; private set; }
 
@@ -73,15 +75,20 @@ namespace Robocon.Course
             BuildWalls();
             BuildPath();
             BuildStartAndGoalTriggers();
+
+            Debug.Log($"[CourseBuilder] Built. PathPoints={pathPoints.Count}, Start={StartPosition}, Goal={GoalPosition}, Instance={(Instance != null)}");
         }
 
         private void BuildPhysicsMaterial()
         {
-            highGripMaterial = new PhysicMaterial("CourseHighGrip")
+            // 駆動力は車輪位置へのAddForceAtPositionで直接与えるため、床とのコライダー間摩擦は
+            // 推進の妨げにしかならない（静止摩擦がPID補正力の上限を上回ると全く動けなくなる）。
+            // 「転がり抵抗は無視する」という仕様の趣旨とも合わせ、ほぼ無摩擦にする。
+            highGripMaterial = new PhysicMaterial("CourseLowFriction")
             {
-                dynamicFriction = 1f,
-                staticFriction = 1f,
-                frictionCombine = PhysicMaterialCombine.Maximum,
+                dynamicFriction = 0f,
+                staticFriction = 0f,
+                frictionCombine = PhysicMaterialCombine.Minimum,
                 bounciness = 0f,
                 bounceCombine = PhysicMaterialCombine.Minimum,
             };
@@ -302,9 +309,17 @@ namespace Robocon.Course
             startTrigger.size = new Vector3(corridorWidth + triggerWidthMargin, triggerHeight, triggerThickness);
             StartLineInstance = startGo.AddComponent<StartLine>();
 
+            // ゴールラインは最終セルの「入口」寄りに置く。ロボットはpathPoints[last]
+            // （セル中心）で停止するため、線をセル中心に置くと停止位置がライン上に
+            // 重なって「完全に通過し終える」（OnTriggerExit）が発火しない。停止前に
+            // 自然に通過し終えられるよう、最終区間の手前寄り（既定30%地点）に配置する。
+            Vector3 goalLinePos = pathPoints.Count >= 2
+                ? Vector3.Lerp(pathPoints[pathPoints.Count - 2], pathPoints[pathPoints.Count - 1], goalLineFraction)
+                : pathPoints[pathPoints.Count - 1];
+
             var goalGo = new GameObject("GoalLine");
             goalGo.transform.SetParent(transform, false);
-            goalGo.transform.position = pathPoints[pathPoints.Count - 1];
+            goalGo.transform.position = goalLinePos;
             goalGo.transform.rotation = Quaternion.LookRotation(goalDir, Vector3.up);
             var goalTrigger = goalGo.AddComponent<BoxCollider>();
             goalTrigger.isTrigger = true;
