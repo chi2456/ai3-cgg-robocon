@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(tasklist)"
+      "Bash(tasklist)",
+      "Bash(\"/c/Program Files/Unity/Hub/Editor/2022.3.62f3/Editor/Unity.exe\" -batchmode -nographics -quit -projectPath \"c:/Users/chika/git/ai3-cgg-robocon\" -logFile \"c:/Users/chika/git/ai3-cgg-robocon/compile_check_final.log\")"
     ]
   }
 }
