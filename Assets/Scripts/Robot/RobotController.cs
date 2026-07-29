@@ -27,25 +27,34 @@ namespace Robocon.Robot
         [SerializeField] private float cameraTopHeight = 1.0f;
         [SerializeField] private float halfTreadWidth = 0.12f;
 
-        [Header("カメラ水平加速度の制約")]
+        [Header("カメラ水平加速度の制約（目標値。実際の上限保証はTrajectoryFollowerのhardLinearAccelLimitで行う）")]
         [SerializeField] private float cameraAccelLimit = 1.0f;
         [Range(0.5f, 1f)]
-        [SerializeField] private float accelSafetyMargin = 0.9f;
+        [SerializeField] private float accelSafetyMargin = 0.95f;
 
-        [Header("直進プロファイル既定値")]
-        [SerializeField] private float defaultMaxSpeed = 0.5f;
+        [Header("直進プロファイル既定値（仕様上「走行速度の上限を設けない」ため、実質無制限の値にする。" +
+                "加速度上限だけで律速されると台形プロファイルは自動的に三角形（最短時間）になる）")]
+        [SerializeField] private float defaultMaxSpeed = 100f;
 
         [Header("信地旋回プロファイル既定値")]
         [Range(0.1f, 0.9f)]
         [SerializeField] private float pivotCentripetalBudgetRatio = 0.6f;
 
-        [Header("超信地旋回プロファイル既定値（制約対象外）")]
-        [SerializeField] private float spinMaxAngularSpeed = 3.0f;
-        [SerializeField] private float spinMaxAngularAccel = 6.0f;
+        [Header("超信地旋回プロファイル既定値（カメラ加速度制約の対象外。Rigidbody.maxAngularVelocity" +
+                "の既定値7rad/sを超えない範囲でできるだけ速く回す）")]
+        [SerializeField] private float spinMaxAngularSpeed = 6.0f;
+        [SerializeField] private float spinMaxAngularAccel = 20.0f;
 
         [Header("コース自動走行")]
         [SerializeField] private bool autoRunCourse = true;
         [SerializeField] private float autoRunStartDelay = 0.3f;
+        [SerializeField] private float segmentSettleSeconds = 0.2f;
+
+        [Header("見た目（Collider/Rigidbodyには影響しない表示専用メッシュ）")]
+        [SerializeField] private float bodyVisualHeight = 0.15f;
+        [SerializeField] private float cameraMastRadius = 0.02f;
+        [SerializeField] private Color bodyColor = new Color(0.2f, 0.45f, 0.9f);
+        [SerializeField] private Color cameraColor = new Color(0.85f, 0.15f, 0.15f);
 
         private Rigidbody rb;
         private WheelDrive wheelDrive;
@@ -67,8 +76,16 @@ namespace Robocon.Robot
 
             BuildRig();
 
-            wheelDrive.Init(rb, halfTreadWidth, comHeight);
-            float yawInertia = 0.5f * robotMass * bodyRadius * bodyRadius;
+            // 車輪への力は重心と同じ高さ（鉛直オフセット0）で加える。床面（重心から0.5m下）で
+            // 加えると、左右輪の力が同方向のためピッチ方向の転倒トルクが常に発生してしまい、
+            // 「水平面内のヨー回転のみ」という前提（＝カメラ頂部の水平加速度=重心並進加速度）が
+            // 崩れてしまうため。トレッド幅方向（ローカルX）のオフセットのみ残すのでヨーモーメントは従来通り生じる。
+            wheelDrive.Init(rb, halfTreadWidth, 0f);
+            // フィードフォワード/PID補正のトルク換算に使う慣性モーメントは、手計算の推定値
+            // （中実円柱近似 0.5*m*r^2）ではなく、Unityが実際のコライダー形状から計算した
+            // rb.inertiaTensorを使う。推定値とのズレがあると角速度制御が過大/過小になり、
+            // 最悪Rigidbody.maxAngularVelocity（既定7rad/s）に張り付いて回転が止まらなくなる。
+            float yawInertia = rb.inertiaTensor.y;
             follower.Init(rb, wheelDrive, robotMass, yawInertia);
             accelLogger.Init(rb, CameraTop);
             validityChecker.Init(rb, this);
@@ -91,11 +108,13 @@ namespace Robocon.Robot
                 capsule.radius = bodyRadius;
                 capsule.height = cameraTopHeight; // 床(-comHeight)からカメラ頂部(+cameraTopHeight-comHeight)まで
                 capsule.center = new Vector3(0f, cameraTopHeight * 0.5f - comHeight, 0f);
-                var mat = new PhysicMaterial("RobotHighGrip")
+                // 駆動力は車輪位置へのAddForceAtPositionで与えるため、胴体コライダーと床の
+                // 摩擦は不要（あるとPID補正力の上限を静止摩擦が上回り走行不能になる）。
+                var mat = new PhysicMaterial("RobotLowFriction")
                 {
-                    dynamicFriction = 1f,
-                    staticFriction = 1f,
-                    frictionCombine = PhysicMaterialCombine.Maximum,
+                    dynamicFriction = 0f,
+                    staticFriction = 0f,
+                    frictionCombine = PhysicMaterialCombine.Minimum,
                     bounciness = 0f,
                     bounceCombine = PhysicMaterialCombine.Minimum,
                 };
@@ -113,6 +132,64 @@ namespace Robocon.Robot
                 camMount = camGo.transform;
             }
             CameraTop = camMount;
+
+            BuildVisuals();
+        }
+
+        /// <summary>Game/Sceneビューでの視認用に、半径0.15mの胴体円柱とカメラ台座までの
+        /// 細い円柱・カメラ頭部を追加する。いずれもColliderは持たせない（物理形状は変更しない）。</summary>
+        private void BuildVisuals()
+        {
+            float floorLocalY = -comHeight;
+            float topLocalY = cameraTopHeight - comHeight;
+
+            if (transform.Find("BodyVisual") == null)
+            {
+                float bodyCenterY = floorLocalY + bodyVisualHeight * 0.5f;
+                CreateVisualCylinder("BodyVisual", transform, new Vector3(0f, bodyCenterY, 0f), bodyRadius, bodyVisualHeight, bodyColor);
+            }
+
+            if (transform.Find("CameraMast") == null)
+            {
+                float mastBottomY = floorLocalY + bodyVisualHeight;
+                float mastHeight = Mathf.Max(topLocalY - mastBottomY, 0.01f);
+                float mastCenterY = mastBottomY + mastHeight * 0.5f;
+                CreateVisualCylinder("CameraMast", transform, new Vector3(0f, mastCenterY, 0f), cameraMastRadius, mastHeight, cameraColor);
+            }
+
+            if (CameraTop.Find("CameraHead") == null)
+            {
+                var head = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                head.name = "CameraHead";
+                var headCollider = head.GetComponent<Collider>();
+                headCollider.enabled = false;
+                Destroy(headCollider);
+                head.transform.SetParent(CameraTop, false);
+                head.transform.localPosition = Vector3.zero;
+                head.transform.localScale = Vector3.one * (cameraMastRadius * 4f);
+                head.GetComponent<Renderer>().sharedMaterial = CreateUnlitColorMaterial(cameraColor);
+            }
+        }
+
+        private void CreateVisualCylinder(string name, Transform parent, Vector3 localPosition, float radius, float height, Color color)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            go.name = name;
+            var col = go.GetComponent<Collider>();
+            col.enabled = false;
+            Destroy(col);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = localPosition;
+            // 既定のCylinderメッシュは半径0.5・高さ2なので、目的の半径・高さに合わせてスケールする。
+            go.transform.localScale = new Vector3(radius * 2f, height * 0.5f, radius * 2f);
+            go.GetComponent<Renderer>().sharedMaterial = CreateUnlitColorMaterial(color);
+        }
+
+        private static Material CreateUnlitColorMaterial(Color color)
+        {
+            var shader = Shader.Find("Standard");
+            var mat = new Material(shader) { color = color };
+            return mat;
         }
 
         private void Start()
@@ -120,7 +197,17 @@ namespace Robocon.Robot
             var course = CourseBuilder.Instance;
             if (course != null)
             {
-                transform.SetPositionAndRotation(course.StartPosition + Vector3.up * comHeight, course.StartRotation);
+                Vector3 spawnPos = course.StartPosition + Vector3.up * comHeight;
+                transform.SetPositionAndRotation(spawnPos, course.StartRotation);
+                // Rigidbodyの物理状態を即時同期する（Physics.autoSyncTransformsの設定に依存しないため）。
+                rb.position = spawnPos;
+                rb.rotation = course.StartRotation;
+                Physics.SyncTransforms();
+                Debug.Log($"[RobotController] Spawned at {transform.position}, heading={transform.eulerAngles.y:F1}deg");
+            }
+            else
+            {
+                Debug.LogWarning("[RobotController] CourseBuilder.Instance is null in Start(); robot stays at its scene-placed transform.");
             }
 
             if (autoRunCourse && course != null)
@@ -208,6 +295,9 @@ namespace Robocon.Robot
         {
             yield return new WaitForFixedUpdate();
             while (IsBusy) yield return new WaitForFixedUpdate();
+            // 摩擦ゼロのため残留速度・角速度は自然には減衰しない。目標値0のままPIDに
+            // 収束させる時間を与えてから次のコマンドへ進み、旋回中のドリフトを防ぐ。
+            yield return new WaitForSeconds(segmentSettleSeconds);
         }
     }
 }

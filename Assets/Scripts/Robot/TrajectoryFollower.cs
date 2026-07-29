@@ -14,20 +14,33 @@ namespace Robocon.Robot
         private enum Mode { Idle, Straight, Pivot, Spin }
 
         [Header("前進速度PIDゲイン")]
-        [SerializeField] private float linearKp = 40f;
-        [SerializeField] private float linearKi = 15f;
-        [SerializeField] private float linearKd = 3f;
-        [SerializeField] private float linearIntegralClamp = 2f;
+        [SerializeField] private float linearKp = 15f;
+        [SerializeField] private float linearKi = 5f;
+        [SerializeField] private float linearKd = 0.5f;
+        [SerializeField] private float linearIntegralClamp = 1f;
+        [SerializeField] private float maxCorrectiveLinearAccel = 3f;
 
         [Header("ヨー角速度PIDゲイン")]
-        [SerializeField] private float angularKp = 10f;
-        [SerializeField] private float angularKi = 4f;
-        [SerializeField] private float angularKd = 0.4f;
-        [SerializeField] private float angularIntegralClamp = 3f;
+        [SerializeField] private float angularKp = 4f;
+        [SerializeField] private float angularKi = 1f;
+        [SerializeField] private float angularKd = 0.05f;
+        [SerializeField] private float angularIntegralClamp = 1f;
+        [SerializeField] private float maxCorrectiveAngularAccel = 10f;
 
-        [Header("直進区間の姿勢保持（外側ループ）")]
-        [SerializeField] private float headingHoldKp = 6f;
+        [Header("直進区間の経路追従（状態フィードバック）")]
+        [Tooltip("状態ベクトル x=[横方向位置誤差, ヘディング誤差] に対する線形状態フィードバック " +
+                 "ω = -(K_lat*x1 + K_head*x2) で目標ヨー角速度を決める。単純な1状態Pのヘディング保持より" +
+                 "堅牢で、蓄積した横ドリフトも直接補正する。内側のヨーPIDより十分遅い帯域になるようゲインを選ぶ。")]
+        [SerializeField] private float stateFeedbackKLateral = 1.2f;
+        [SerializeField] private float stateFeedbackKHeading = 1.5f;
         [SerializeField] private float maxHeadingCorrectionOmega = 1.5f;
+
+        [Header("転倒防止（ピッチ・ロールの自己復元、ヨー制御には影響しない）")]
+        [SerializeField] private float levelingKp = 40f;
+        [SerializeField] private float levelingKd = 8f;
+
+        [Header("カメラ水平加速度の絶対上限（フィードフォワード+PID補正の合計をここでハードクランプする）")]
+        [SerializeField] private float hardLinearAccelLimit = 0.98f;
 
         private Rigidbody rb;
         private WheelDrive wheelDrive;
@@ -39,6 +52,11 @@ namespace Robocon.Robot
         private float segmentTime;
         private float pivotRadius;
         private float targetHeadingDeg;
+        private Vector3 segmentStartPos;
+        private Vector3 segmentRightAxis;
+
+        public float LastLateralError { get; private set; }
+        public float LastHeadingErrorDeg { get; private set; }
 
         private float vIntegral, vPrevError;
         private float wIntegral, wPrevError;
@@ -64,6 +82,8 @@ namespace Robocon.Robot
             segmentTime = 0f;
             pivotRadius = 0f;
             targetHeadingDeg = transform.eulerAngles.y;
+            segmentStartPos = transform.position;
+            segmentRightAxis = transform.right;
             IsSegmentFinished = false;
             ResetPid();
         }
@@ -118,8 +138,19 @@ namespace Robocon.Robot
                     case Mode.Straight:
                         targetV = s.Velocity;
                         targetVAccel = s.Acceleration;
+
+                        // 状態フィードバック: x = [横方向位置誤差 y(m), ヘディング誤差 θ(rad)]
+                        // （yは基準直線からの符号付き垂直距離、θ=DeltaAngle(現在, 目標)=目標-現在）。
+                        // 運動学 dy/dt=v・(現在ヘディング-目標ヘディング)=-v・θ, dθ/dt=-ω を
+                        // u=ω=-K_lat・y+K_head・θ で閉ループすると
+                        // y''+K_head・y'+v・K_lat・y=0 という安定な2次系になる（K_lat,K_head>0で減衰）。
+                        float lateralError = Vector3.Dot(transform.position - segmentStartPos, segmentRightAxis);
                         float headingErrorRad = Mathf.DeltaAngle(transform.eulerAngles.y, targetHeadingDeg) * Mathf.Deg2Rad;
-                        targetOmega = Mathf.Clamp(headingHoldKp * headingErrorRad, -maxHeadingCorrectionOmega, maxHeadingCorrectionOmega);
+                        LastLateralError = lateralError;
+                        LastHeadingErrorDeg = headingErrorRad * Mathf.Rad2Deg;
+
+                        float stateFeedbackOmega = -stateFeedbackKLateral * lateralError + stateFeedbackKHeading * headingErrorRad;
+                        targetOmega = Mathf.Clamp(stateFeedbackOmega, -maxHeadingCorrectionOmega, maxHeadingCorrectionOmega);
                         targetOmegaAccel = 0f;
                         break;
                     case Mode.Pivot:
@@ -148,19 +179,61 @@ namespace Robocon.Robot
             vIntegral = Mathf.Clamp(vIntegral + vError * dt, -linearIntegralClamp, linearIntegralClamp);
             float vDeriv = dt > 1e-9f ? (vError - vPrevError) / dt : 0f;
             vPrevError = vError;
-            float correctiveAccelV = linearKp * vError + linearKi * vIntegral + linearKd * vDeriv;
-            float forwardForce = mass * (targetVAccel + correctiveAccelV);
+            float correctiveAccelV = Mathf.Clamp(
+                linearKp * vError + linearKi * vIntegral + linearKd * vDeriv,
+                -maxCorrectiveLinearAccel, maxCorrectiveLinearAccel);
+            // 台形プロファイルは巡航→減速の境界で目標加速度が不連続にジャンプする（ジャーク不連続）。
+            // PID追従精度だけに頼ると、この境界やその他の過渡応答で必須条件の1.00 m/s^2を
+            // 一時的に超えうるため、水平加速度＝重心並進加速度そのもの（この設計の前提）を
+            // 直接ハードクランプし、常に上限内に収まることを物理的に保証する。
+            float totalLinearAccel = Mathf.Clamp(targetVAccel + correctiveAccelV, -hardLinearAccelLimit, hardLinearAccelLimit);
+            float forwardForce = mass * totalLinearAccel;
 
             float wError = targetOmega - actualOmega;
             wIntegral = Mathf.Clamp(wIntegral + wError * dt, -angularIntegralClamp, angularIntegralClamp);
             float wDeriv = dt > 1e-9f ? (wError - wPrevError) / dt : 0f;
             wPrevError = wError;
-            float correctiveAccelW = angularKp * wError + angularKi * wIntegral + angularKd * wDeriv;
+            float correctiveAccelW = Mathf.Clamp(
+                angularKp * wError + angularKi * wIntegral + angularKd * wDeriv,
+                -maxCorrectiveAngularAccel, maxCorrectiveAngularAccel);
             float yawTorque = yawInertia * (targetOmegaAccel + correctiveAccelW);
 
             LastForwardForce = forwardForce;
             LastYawTorque = yawTorque;
             wheelDrive.ApplyDrive(forwardForce, yawTorque);
+
+            ApplyTiltStabilization();
+            ConstrainLateralSlip();
+        }
+
+        /// <summary>
+        /// 実車の車輪は前後には転がるが横方向には滑りにくい（非ホロノミック拘束）。
+        /// 床の摩擦を0にした副作用でこの拘束が失われ、旋回中のわずかな横成分が
+        /// 一切補正されず蓄積してドリフトする問題が生じたため、横方向速度成分を
+        /// 毎ステップ明示的にゼロへ落として車輪のグリップを表現する。
+        /// </summary>
+        private void ConstrainLateralSlip()
+        {
+            Vector3 lateral = Vector3.Dot(rb.velocity, transform.right) * transform.right;
+            rb.velocity -= lateral;
+        }
+
+        /// <summary>ロボットは水平面内のヨー回転のみを行う設計（ピッチ・ロールしない）という
+        /// 前提を成り立たせるため、車体の自己復元力（低いキャスター相当の機械的安定性）を
+        /// ピッチ・ロール軸にのみ作用する復元トルクとしてモデル化する。ヨー角速度は一切変更しない。</summary>
+        private void ApplyTiltStabilization()
+        {
+            Vector3 tiltAxis = Vector3.Cross(transform.up, Vector3.up);
+            float tiltAngle = Vector3.Angle(transform.up, Vector3.up) * Mathf.Deg2Rad;
+
+            if (tiltAngle > 1e-4f)
+            {
+                rb.AddTorque(tiltAxis.normalized * (tiltAngle * levelingKp), ForceMode.Force);
+            }
+
+            Vector3 yawAngularVelocity = Vector3.Dot(rb.angularVelocity, transform.up) * transform.up;
+            Vector3 tiltAngularVelocity = rb.angularVelocity - yawAngularVelocity;
+            rb.AddTorque(-tiltAngularVelocity * levelingKd, ForceMode.Force);
         }
     }
 }

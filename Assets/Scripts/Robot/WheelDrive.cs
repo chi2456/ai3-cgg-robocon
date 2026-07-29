@@ -47,8 +47,12 @@ namespace Robocon.Robot
             float halfForce = forwardForceNewtons * 0.5f;
             float diffForce = halfTreadWidth > 1e-6f ? yawTorqueNewtonMeters / (2f * halfTreadWidth) : 0f;
 
-            float leftForce = halfForce - diffForce;
-            float rightForce = halfForce + diffForce;
+            // 注意: r_left×F_left + r_right×F_right を計算すると、rightForceを増やすほど
+            // 実際のトルクはUP軸の負方向に生じる（right×forward = -up のため）。
+            // 指令したyawTorqueNewtonMetersの符号と実際に生じるトルクの符号を一致させるため、
+            // 右輪にはdiffForceを「引く」側を割り当てる（直感とは逆に見えるが正しい）。
+            float leftForce = halfForce + diffForce;
+            float rightForce = halfForce - diffForce;
 
             LastLeftForce = leftForce;
             LastRightForce = rightForce;
